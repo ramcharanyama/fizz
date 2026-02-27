@@ -28,11 +28,24 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["PII Redaction"])
 
-# Singleton orchestrator
-orchestrator = RedactionOrchestrator()
+# ── Lazy orchestrator (never crashes at import time) ─────
+_orchestrator = None
+
+
+def get_orchestrator():
+    """Return the singleton orchestrator, creating it on first call."""
+    global _orchestrator
+    if _orchestrator is None:
+        try:
+            _orchestrator = RedactionOrchestrator()
+            logger.info("RedactionOrchestrator initialized successfully")
+        except Exception as e:
+            logger.error("Failed to initialize orchestrator: %s", e)
+            raise
+    return _orchestrator
+
 
 # Thread pool - keeps heavy CPU work off the event loop
-# Use min(4, cpu_count) workers; image/audio/video are I/O + CPU bound
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
@@ -52,7 +65,7 @@ async def run_blocking(fn, *args, **kwargs):
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check — always fast, never blocked by heavy ops."""
-    engines = orchestrator.get_engine_status()
+    engines = get_orchestrator().get_engine_status()
     return HealthResponse(
         status="healthy",
         version="2.0.0",
@@ -69,20 +82,20 @@ async def get_strategies():
 
 @router.get("/entity-types")
 async def get_entity_types():
-    regex_types = orchestrator.regex_engine.get_supported_types()
-    nlp_types = orchestrator.nlp_engine.get_supported_types() if orchestrator.nlp_engine.is_available() else []
+    regex_types = get_orchestrator().regex_engine.get_supported_types()
+    nlp_types = get_orchestrator().nlp_engine.get_supported_types() if get_orchestrator().nlp_engine.is_available() else []
     all_types = sorted(set(regex_types + nlp_types))
     return {"entity_types": all_types, "regex_types": regex_types, "nlp_types": nlp_types, "total": len(all_types)}
 
 
 @router.get("/stats")
 async def get_stats():
-    return orchestrator.get_stats()
+    return get_orchestrator().get_stats()
 
 
 @router.get("/engines")
 async def get_engines():
-    return orchestrator.get_engine_status()
+    return get_orchestrator().get_engine_status()
 
 
 # ──────────────────────────────────────────────────────
@@ -94,7 +107,7 @@ async def redact_text(request: RedactTextRequest):
     """Redact PII from plain text. Runs inline (fast, regex+NLP only)."""
     try:
         result = await run_blocking(
-            orchestrator.redact_text,
+            get_orchestrator().redact_text,
             request.text,
             request.strategy.value,
             request.entity_types,
@@ -124,7 +137,7 @@ async def redact_file(
     try:
         file_bytes = await file.read()
         result = await run_blocking(
-            orchestrator.redact_file_bytes,
+            get_orchestrator().redact_file_bytes,
             file_bytes, filename, content_type, strategy.value
         )
         return FileUploadResponse(**result)
@@ -151,7 +164,7 @@ async def redact_image(
     try:
         image_bytes = await file.read()
         # ← run_in_executor keeps EasyOCR off the event loop
-        result = await run_blocking(orchestrator.redact_image, image_bytes, filename, strategy.value)
+        result = await run_blocking(get_orchestrator().redact_image, image_bytes, filename, strategy.value)
         result.pop("redacted_image_bytes", None)
         return JSONResponse(content=result)
     except Exception as e:
@@ -176,7 +189,7 @@ async def redact_pdf(
 
     try:
         pdf_bytes = await file.read()
-        result = await run_blocking(orchestrator.redact_pdf, pdf_bytes, filename, strategy.value)
+        result = await run_blocking(get_orchestrator().redact_pdf, pdf_bytes, filename, strategy.value)
         result.pop("redacted_pdf_bytes", None)
         return JSONResponse(content=result)
     except Exception as e:
@@ -201,7 +214,7 @@ async def redact_audio(
 
     try:
         audio_bytes = await file.read()
-        result = await run_blocking(orchestrator.redact_audio, audio_bytes, filename, strategy.value)
+        result = await run_blocking(get_orchestrator().redact_audio, audio_bytes, filename, strategy.value)
         result.pop("redacted_audio_bytes", None)
         return JSONResponse(content=result)
     except Exception as e:
@@ -226,7 +239,7 @@ async def redact_video(
 
     try:
         video_bytes = await file.read()
-        result = await run_blocking(orchestrator.redact_video, video_bytes, filename, strategy.value)
+        result = await run_blocking(get_orchestrator().redact_video, video_bytes, filename, strategy.value)
         result.pop("redacted_video_bytes", None)
         return JSONResponse(content=result)
     except Exception as e:
@@ -244,7 +257,7 @@ async def batch_redact(request: BatchRedactRequest):
         raise HTTPException(status_code=400, detail="Maximum 100 texts per batch")
     try:
         result = await run_blocking(
-            orchestrator.batch_redact,
+            get_orchestrator().batch_redact,
             request.texts, request.strategy.value, request.entity_types
         )
         return BatchRedactResponse(**result)
@@ -263,11 +276,11 @@ async def download_file(job_id: str):
     Stream a redacted file by job ID.
     Fast — just reads pre-saved file from disk, no processing.
     """
-    job = orchestrator.download_manager.get_job(job_id)
+    job = get_orchestrator().download_manager.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or expired. Please re-upload and redact.")
 
-    filepath = orchestrator.download_manager.get_filepath(job_id)
+    filepath = get_orchestrator().download_manager.get_filepath(job_id)
     if not filepath:
         raise HTTPException(status_code=404, detail="File not found on disk.")
 
@@ -285,7 +298,7 @@ async def download_file(job_id: str):
 @router.get("/download/{job_id}/info")
 async def download_info(job_id: str):
     """Get metadata about a download job."""
-    job = orchestrator.download_manager.get_job(job_id)
+    job = get_orchestrator().download_manager.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found or expired")
     return {
